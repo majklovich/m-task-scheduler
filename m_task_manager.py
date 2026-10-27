@@ -6,6 +6,7 @@ import re
 import shlex
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from collections import defaultdict, deque
@@ -14,7 +15,8 @@ from pathlib import Path
 from xml.parsers.expat import ExpatError
 
 import psutil
-from PySide6.QtCore import QLocale, Qt, QTimer
+from pynput import keyboard
+from PySide6.QtCore import QLocale, QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
     QApplication,
@@ -116,6 +118,13 @@ TRANSLATIONS = {
         "Process did not exit": "Proces se neukončil",
         "“{name}” is still running. Force quit it?": "Proces „{name}“ stále běží. Vynutit jeho ukončení?",
         "Could not force quit process: {error}": "Proces nelze vynuceně ukončit: {error}",
+        "Global shortcut is unavailable: {error}": "Globální klávesová zkratka není dostupná: {error}",
+        "Could not start the global shortcut: {error}": (
+            "Nelze spustit globální klávesovou zkratku: {error}"
+        ),
+        "Allow m-task-manager in macOS Privacy & Security > Accessibility, then restart the app.": (
+            "Povolte m-task-manager v macOS Soukromí a zabezpečení > Zpřístupnění a poté aplikaci restartujte."
+        ),
         "Could not end process: {error}": "Proces nelze ukončit: {error}",
         "Sent a quit signal to {name} (PID {pid}).": "Procesu {name} (PID {pid}) byl odeslán signál k ukončení.",
         "Cancel": "Zrušit",
@@ -141,6 +150,76 @@ def system_language() -> str:
 
 def tr(text: str, language: str) -> str:
     return TRANSLATIONS.get(language, {}).get(text, text)
+
+
+HOTKEY_AGENT_LABEL = "com.mtaskmanager.hotkey"
+
+
+def install_hotkey_agent() -> None:
+    if not getattr(sys, "frozen", False):
+        return
+
+    app_bundle = Path(sys.executable).resolve().parents[2]
+    agent_executable = app_bundle / "Contents" / "MacOS" / "m-task-manager"
+    agent_directory = Path.home() / "Library" / "LaunchAgents"
+    agent_path = agent_directory / f"{HOTKEY_AGENT_LABEL}.plist"
+    log_path = Path.home() / "Library" / "Logs" / "m-task-manager-hotkey.log"
+    domain = f"gui/{os.getuid()}"
+    arguments = [str(agent_executable), "--hotkey-daemon"]
+    agent = {
+        "Label": HOTKEY_AGENT_LABEL,
+        "ProgramArguments": arguments,
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        "LimitLoadToSessionType": "Aqua",
+        "StandardOutPath": str(log_path),
+        "StandardErrorPath": str(log_path),
+    }
+
+    agent_directory.mkdir(parents=True, exist_ok=True)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    current_agent = None
+    if agent_path.exists():
+        with agent_path.open("rb") as agent_file:
+            current_agent = plistlib.load(agent_file)
+    if current_agent != agent:
+        subprocess.run(
+            ["launchctl", "bootout", domain, str(agent_path)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        temporary_path = agent_path.with_suffix(".plist.tmp")
+        with temporary_path.open("wb") as agent_file:
+            plistlib.dump(agent, agent_file)
+        temporary_path.replace(agent_path)
+
+    loaded = subprocess.run(
+        ["launchctl", "print", f"{domain}/{HOTKEY_AGENT_LABEL}"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if loaded.returncode != 0:
+        subprocess.run(["launchctl", "bootstrap", domain, str(agent_path)], check=True)
+
+
+def run_hotkey_daemon() -> int:
+    activate = lambda: subprocess.Popen(
+        ["/usr/bin/open", "-a", str(Path(sys.executable).resolve().parents[2])]
+    )
+    hotkeys = {
+        f"<{command}>+<{option}>+<backspace>": activate
+        for command in ("cmd_l", "cmd_r")
+        for option in ("alt_l", "alt_r")
+    }
+    listener = keyboard.GlobalHotKeys(hotkeys)
+    listener.start()
+    try:
+        listener.join()
+    finally:
+        listener.stop()
+    return 0
 
 
 @dataclass
@@ -388,6 +467,12 @@ def make_table(headers: list[str], language: str, stretch_last: bool = True) -> 
     table.verticalHeader().setDefaultSectionSize(29)
     table.horizontalHeader().setHighlightSections(False)
     table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+    if "PID" in headers:
+        pid_column = headers.index("PID")
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(pid_column, QHeaderView.ResizeMode.Interactive)
+        minimum_pid_width = table.fontMetrics().horizontalAdvance("88888888") + 16
+        table.setColumnWidth(pid_column, max(table.columnWidth(pid_column), minimum_pid_width))
     if stretch_last:
         table.horizontalHeader().setStretchLastSection(True)
     table.setSortingEnabled(True)
@@ -403,6 +488,11 @@ class SortableItem(QTableWidgetItem):
         if isinstance(other, SortableItem):
             return self.sort_value < other.sort_value
         return super().__lt__(other)
+
+
+class HotkeyBridge(QObject):
+    activated = Signal()
+    failed = Signal(str)
 
 
 class MainWindow(QMainWindow):
@@ -429,10 +519,61 @@ class MainWindow(QMainWindow):
         self._build_shell()
         self._apply_style()
         QApplication.styleHints().colorSchemeChanged.connect(self._system_theme_changed)
+        if getattr(sys, "frozen", False):
+            try:
+                install_hotkey_agent()
+            except (OSError, plistlib.InvalidFileException, subprocess.SubprocessError) as error:
+                self.statusBar().showMessage(
+                    tr("Could not start the global shortcut: {error}", self.language).format(
+                        error=error
+                    )
+                )
+        else:
+            self.hotkey_bridge = HotkeyBridge(self)
+            self.hotkey_bridge.activated.connect(self._activate_window)
+            self.hotkey_bridge.failed.connect(self._hotkey_failed)
+            self._start_hotkey_listener()
         self.show_section("Processes")
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh)
         self.timer.start(1500)
+
+    def _start_hotkey_listener(self) -> None:
+        activate = self.hotkey_bridge.activated.emit
+        hotkeys = {
+            f"<{command}>+<{option}>+<backspace>": activate
+            for command in ("cmd_l", "cmd_r")
+            for option in ("alt_l", "alt_r")
+        }
+        self.hotkey_listener = keyboard.GlobalHotKeys(hotkeys)
+        self.hotkey_listener.start()
+        self.hotkey_monitor = threading.Thread(
+            target=self._monitor_hotkey_listener,
+            name="m-task-manager-hotkey",
+            daemon=True,
+        )
+        self.hotkey_monitor.start()
+
+    def _monitor_hotkey_listener(self) -> None:
+        try:
+            self.hotkey_listener.wait()
+            self.hotkey_listener.join()
+        except (OSError, RuntimeError) as error:
+            self.hotkey_bridge.failed.emit(str(error))
+
+    def _activate_window(self) -> None:
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _hotkey_failed(self, error: str) -> None:
+        message = tr("Global shortcut is unavailable: {error}", self.language).format(error=error)
+        permission_hint = tr(
+            "Allow m-task-manager in macOS Privacy & Security > Accessibility, then restart the app.",
+            self.language,
+        )
+        self.statusBar().showMessage(f"{message} {permission_hint}")
+
 
     def _build_shell(self) -> None:
         root = QWidget()
@@ -1308,11 +1449,20 @@ class MainWindow(QMainWindow):
 
 
 def main() -> int:
+    if "--hotkey-daemon" in sys.argv:
+        try:
+            return run_hotkey_daemon()
+        except (OSError, RuntimeError) as error:
+            print(f"Global shortcut listener failed: {error}", file=sys.stderr)
+            return 1
+
     app = QApplication(sys.argv)
     app.setApplicationName("m-task-manager")
     app.setOrganizationName("m-task-manager")
     window = MainWindow()
     app.aboutToQuit.connect(window.monitor.shutdown)
+    if hasattr(window, "hotkey_listener"):
+        app.aboutToQuit.connect(window.hotkey_listener.stop)
     window.show()
     return app.exec()
 
