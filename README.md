@@ -39,24 +39,40 @@ The app is created at `dist/m-task-manager.app`. To set up the global shortcut:
 If you move the app after setup, open it once from its new location to update the
 background listener.
 
+The macOS build reuses the native Activity Monitor icon for the app's Finder and
+Dock icon.
+
 ## Features
 
-- Live process list with search, sorting, CPU and memory usage, and a confirmed
-  End task action.
+- Live process list with search, sorting, CPU, memory, disk, network, and GPU
+  columns in a Windows-style layout, heatmap coloring,
+  and separate End task / Force end task actions. End task requests a normal
+  stop; Force end task terminates the process immediately. Neither action asks
+  for confirmation.
+  App icons appear beside main app processes; other processes are grouped under
+  a collapsible Others row. The list starts sorted by memory use (highest first).
 - Performance charts for CPU and memory, plus system-wide disk and network
-  activity.
+  activity. Charts use a colored filled area and line.
 - Process details, logged-in users, launchd startup items, and launchd services.
+- Startup items use readable app names and icons when macOS provides them, with
+  their technical launchd labels available in the details column. The Users
+  page lists regular local accounts with their display names.
 - App history accumulates process CPU time only while m-task-manager is open.
 - Startup agents and daemons can be disabled or re-enabled through launchd.
+- Navigation uses horizontal tabs, and process actions sit at the bottom right.
 
-The first process scan runs in the background so the window opens immediately.
-Process data refreshes every five seconds while performance charts continue
-updating between scans. Pages and their system inventories are kept in memory,
-so revisiting a section does not rebuild or rescan it.
+Process scans, launchd inventories, process details, and task termination run in
+the background so the interface stays responsive while they complete.
+The first process scan starts immediately and the list is updated as soon as
+the background scan finishes. Process data refreshes every 2.5 seconds, and
+ending a task triggers an immediate scan so the list reacts promptly.
+Performance charts continue updating between scans. Pages and their system
+inventories are kept in memory, so revisiting a section does not rebuild or
+rescan it.
 Use **Refresh** on Startup apps or Services to reload those lists. Disabling a
 system daemon may require administrator approval; the app changes its launchd
 override and does not remove the original plist.
 
-macOS does not expose per-process disk and network activity through the APIs
-used here, so those two columns are intentionally shown as unavailable. Disk
+macOS does not expose per-process disk, network, or GPU activity through the
+APIs used here, so those columns are intentionally shown as unavailable. Disk
 and network activity on the Performance page are system-wide.
